@@ -113,6 +113,9 @@
 
         <!-- Sign Up Form -->
         <form id="signup-form" onsubmit="handleSignup(event)" class="space-y-4 hidden">
+          <div id="signup-device-lock-notice" class="hidden px-4 py-3 rounded-2xl bg-amber-50 border border-amber-200 text-amber-800 text-xs font-bold leading-relaxed">
+            An account has already been created on this device. Multiple accounts on one device are not allowed. Please login to your existing account.
+          </div>
           <div>
             <label class="block text-xs font-semibold text-slate-600 mb-1.5">Username</label>
             <input type="text" id="signup-username" required minlength="3" maxlength="30" placeholder="johndoe"
@@ -748,6 +751,7 @@
     firebase.initializeApp(firebaseConfig);
     const auth = firebase.auth();
     const db = firebase.database();
+    const DB_BASE_URL = db.ref().toString().replace(/\/+$/, '');
 
     // ==================== VIP PLANS ====================
     const VIP_PLANS = [
@@ -779,16 +783,25 @@
       Upaisa:    'https://i.ibb.co/93VVdBQg/Screenshot-20261115-142047.png'
     };
 
-    const STORAGE_PENDING_REF = 'oc_pending_ref_v1';
-    const STORAGE_DEVICE_ID   = 'oc_device_id_v1';
-    const STORAGE_OWNED_REFS  = 'oc_owned_refs_v1';
-    const STORAGE_LOGIN_FAILS = 'oc_login_fails_v1';
-    const STORAGE_LOGIN_LOCK  = 'oc_login_lock_v1';
-    const ONE_DAY_MS = 24 * 60 * 60 * 1000;
-    const MIN_WITHDRAW_RS = 2;
-    const CACHE_TTL_MS = 180000;
-    const HISTORY_PAGE_SIZE = 25;
-    const TEAM_PAGE_SIZE = 20;
+    const STORAGE_PENDING_REF       = 'oc_pending_ref_v1';
+    const STORAGE_DEVICE_ID         = 'oc_device_id_v1';
+    const STORAGE_DEVICE_REGISTERED = 'oc_device_registered_v1';
+    const STORAGE_OWNED_REFS        = 'oc_owned_refs_v1';
+    const STORAGE_LOGIN_FAILS       = 'oc_login_fails_v1';
+    const STORAGE_LOGIN_LOCK        = 'oc_login_lock_v1';
+
+    const ONE_DAY_MS               = 24 * 60 * 60 * 1000;
+    const DEPOSIT_BAN_DURATION_MS  = 3 * 24 * 60 * 60 * 1000;
+    const MAX_REJECTED_DEPOSITS    = 5;
+    const MIN_WITHDRAW_RS          = 2;
+
+    // Smart adaptive TTLs for minimal Firebase usage
+    const NORMAL_CACHE_TTL_MS      = 900000;  // 15 minutes when no pending requests
+    const PENDING_CACHE_TTL_MS     = 60000;   // 1 minute when waiting on Pending deposit/withdraw
+    const PENDING_SAFETY_TTL_MS    = 1800000; // 30 minutes safety fallback
+    const HISTORY_TTL_MS           = 120000;  // 2 minutes
+    const HISTORY_PAGE_SIZE        = 25;
+    const TEAM_PAGE_SIZE           = 20;
 
     // ==================== RUNTIME STATE ====================
     let currentTab = 'home';
@@ -819,10 +832,13 @@
     let teamOldestTs = 0;
 
     let lastMainSyncAt = 0;
+    let lastPendingSyncAt = 0;
+    let hasSyncedPendingOnce = false;
     let lastHistorySyncAt = 0;
     let lastTeamFetchAt = 0;
 
     let isSigningUpFlow = false;
+    let isAuthenticatingCheck = false;
     let isSyncingCredits = false;
     let isRefreshing = false;
     let isInvesting = false;
@@ -830,7 +846,7 @@
     let isSubmittingDeposit = false;
     let isSubmittingWithdraw = false;
 
-    // ==================== SMART ON-DEMAND CONNECTION MANAGER ====================
+    // ==================== REST API READS (0 SIMULTANEOUS CONNECTIONS) + FAST WEBSOCKET WRITES ====================
     let activeDbOps = 0;
     let offlineGraceTimer = null;
     let hideDisconnectTimer = null;
@@ -844,6 +860,41 @@
       if (snap.val() !== null) serverTimeOffset = snap.val();
     });
 
+    async function restGet(path, queryParams = {}, userObj = null) {
+      const user = userObj || currentAuthUser || auth.currentUser;
+      if (!user) throw new Error('Not authenticated');
+
+      const buildUrl = (token) => {
+        const cleanPath = String(path).replace(/^\/+/, '');
+        const qs = [];
+        for (const [k, v] of Object.entries(queryParams)) {
+          if (v === undefined || v === null) continue;
+          if (k === 'orderBy' || k === 'equalTo' || k === 'startAt' || k === 'endAt') {
+            qs.push(`${encodeURIComponent(k)}=${encodeURIComponent(JSON.stringify(v))}`);
+          } else {
+            qs.push(`${encodeURIComponent(k)}=${encodeURIComponent(String(v))}`);
+          }
+        }
+        qs.push(`auth=${encodeURIComponent(token)}`);
+        return `${DB_BASE_URL}/${cleanPath}.json?${qs.join('&')}`;
+      };
+
+      let token = await user.getIdToken();
+      let res = await fetch(buildUrl(token), { cache: 'no-store' });
+
+      if (res.status === 401) {
+        token = await user.getIdToken(true);
+        res = await fetch(buildUrl(token), { cache: 'no-store' });
+      }
+
+      if (!res.ok) {
+        const errText = await res.text().catch(() => '');
+        throw new Error(`RTDB REST ${res.status}: ${errText}`);
+      }
+
+      return await res.json();
+    }
+
     async function runDbTask(fn) {
       clearTimeout(offlineGraceTimer);
       activeDbOps++;
@@ -855,7 +906,7 @@
         if (activeDbOps === 0) {
           offlineGraceTimer = setTimeout(() => {
             if (activeDbOps === 0) db.goOffline();
-          }, 2500);
+          }, 350);
         }
       }
     }
@@ -892,6 +943,10 @@
       }, 60000);
     }
 
+    function getEffectiveSyncTtl() {
+      return (hasPendingDeposit() || hasPendingWithdraw()) ? PENDING_CACHE_TTL_MS : NORMAL_CACHE_TTL_MS;
+    }
+
     window.addEventListener('pagehide', forceInstantDisconnect);
     window.addEventListener('beforeunload', forceInstantDisconnect);
     document.addEventListener('freeze', forceInstantDisconnect);
@@ -901,11 +956,11 @@
         clearTimeout(hideDisconnectTimer);
         hideDisconnectTimer = setTimeout(() => {
           if (document.hidden) stopTimersAndSleep();
-        }, 3000);
+        }, 1500);
       } else {
         clearTimeout(hideDisconnectTimer);
         wakeUpFromSleep();
-        if (currentAuthUser && (Date.now() - lastMainSyncAt) > CACHE_TTL_MS) {
+        if (currentAuthUser && (Date.now() - lastMainSyncAt) > getEffectiveSyncTtl()) {
           syncUserDashboard(false);
         }
       }
@@ -916,6 +971,180 @@
         if (currentAuthUser) wakeUpFromSleep();
       }, { passive: true });
     });
+
+    // ==================== PERSISTENT DEVICE STORAGE (LocalStorage + IndexedDB + Cookie) ====================
+    function idbGet(key) {
+      return new Promise((resolve) => {
+        try {
+          if (!window.indexedDB) return resolve(null);
+          const req = indexedDB.open('oc_device_store', 1);
+          req.onupgradeneeded = () => {
+            const database = req.result;
+            if (!database.objectStoreNames.contains('kv')) database.createObjectStore('kv');
+          };
+          req.onsuccess = () => {
+            try {
+              const database = req.result;
+              const tx = database.transaction('kv', 'readonly');
+              const getReq = tx.objectStore('kv').get(key);
+              getReq.onsuccess = () => resolve(getReq.result || null);
+              getReq.onerror = () => resolve(null);
+            } catch { resolve(null); }
+          };
+          req.onerror = () => resolve(null);
+        } catch { resolve(null); }
+      });
+    }
+
+    function idbSet(key, val) {
+      return new Promise((resolve) => {
+        try {
+          if (!window.indexedDB) return resolve(false);
+          const req = indexedDB.open('oc_device_store', 1);
+          req.onupgradeneeded = () => {
+            const database = req.result;
+            if (!database.objectStoreNames.contains('kv')) database.createObjectStore('kv');
+          };
+          req.onsuccess = () => {
+            try {
+              const database = req.result;
+              const tx = database.transaction('kv', 'readwrite');
+              tx.objectStore('kv').put(val, key);
+              tx.oncomplete = () => resolve(true);
+              tx.onerror = () => resolve(false);
+            } catch { resolve(false); }
+          };
+          req.onerror = () => resolve(false);
+        } catch { resolve(false); }
+      });
+    }
+
+    function getCookieVal(name) {
+      const match = document.cookie.match(new RegExp('(?:^|; )' + name + '=([^;]*)'));
+      return match ? decodeURIComponent(match[1]) : null;
+    }
+
+    function setCookieVal(name, val) {
+      try {
+        document.cookie = `${name}=${encodeURIComponent(val)}; max-age=315360000; path=/; SameSite=Lax`;
+      } catch { /* ignore */ }
+    }
+
+    async function syncPersistentDeviceId() {
+      let id = localStorage.getItem(STORAGE_DEVICE_ID) || getCookieVal(STORAGE_DEVICE_ID);
+      if (!id) {
+        id = await idbGet(STORAGE_DEVICE_ID);
+      }
+      if (!id || !/^[A-Za-z0-9_-]{8,80}$/.test(id)) {
+        id = (window.crypto && crypto.randomUUID)
+          ? crypto.randomUUID()
+          : 'dev_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 12);
+      }
+      localStorage.setItem(STORAGE_DEVICE_ID, id);
+      setCookieVal(STORAGE_DEVICE_ID, id);
+      await idbSet(STORAGE_DEVICE_ID, id);
+      return id;
+    }
+
+    function getDeviceId() {
+      let id = localStorage.getItem(STORAGE_DEVICE_ID) || getCookieVal(STORAGE_DEVICE_ID);
+      if (!id || !/^[A-Za-z0-9_-]{8,80}$/.test(id)) {
+        id = (window.crypto && crypto.randomUUID)
+          ? crypto.randomUUID()
+          : 'dev_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 12);
+      }
+      localStorage.setItem(STORAGE_DEVICE_ID, id);
+      setCookieVal(STORAGE_DEVICE_ID, id);
+      idbSet(STORAGE_DEVICE_ID, id);
+      return id;
+    }
+
+    function getWebGLInfo() {
+      try {
+        const canvas = document.createElement('canvas');
+        const gl = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
+        if (!gl) return 'nogl';
+        const dbg = gl.getExtension('WEBGL_debug_renderer_info');
+        if (dbg) {
+          return (gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL) || '') + '~' + (gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) || '');
+        }
+        return (gl.getParameter(gl.VENDOR) || '') + '~' + (gl.getParameter(gl.RENDERER) || '');
+      } catch {
+        return 'nogl';
+      }
+    }
+
+    function getDeviceHash() {
+      const raw = [
+        navigator.userAgent || '',
+        screen.width + 'x' + screen.height + 'x' + (screen.colorDepth || '') + 'x' + (window.devicePixelRatio || 1),
+        Intl.DateTimeFormat().resolvedOptions().timeZone || '',
+        navigator.hardwareConcurrency || '',
+        navigator.deviceMemory || '',
+        navigator.maxTouchPoints || 0,
+        navigator.platform || '',
+        navigator.language || '',
+        getWebGLInfo()
+      ].join('|');
+
+      let h1 = 0x811c9dc5;
+      let h2 = 0x9e3779b9;
+      let h3 = 0x45d9f3b;
+      let h4 = 0x27d4eb2f;
+      for (let i = 0; i < raw.length; i++) {
+        const ch = raw.charCodeAt(i);
+        h1 = Math.imul(h1 ^ ch, 0x01000193);
+        h2 = Math.imul(h2 ^ (ch + i), 0x85ebca6b);
+        h3 = Math.imul(h3 ^ (ch * 31 + i), 0xc2b2ae35);
+        h4 = Math.imul(h4 ^ (ch + (i << 1)), 0x165667b1);
+      }
+      return (
+        (h1 >>> 0).toString(16).padStart(8, '0') +
+        (h2 >>> 0).toString(16).padStart(8, '0') +
+        (h3 >>> 0).toString(16).padStart(8, '0') +
+        (h4 >>> 0).toString(16).padStart(8, '0')
+      );
+    }
+
+    function getOwnedRefCodes() {
+      try { return JSON.parse(localStorage.getItem(STORAGE_OWNED_REFS) || '[]'); }
+      catch { return []; }
+    }
+
+    function addOwnedRefCode(code) {
+      const list = getOwnedRefCodes();
+      if (!list.includes(code)) {
+        list.push(code);
+        localStorage.setItem(STORAGE_OWNED_REFS, JSON.stringify(list));
+      }
+    }
+
+    async function markDeviceLocallyRegistered() {
+      localStorage.setItem(STORAGE_DEVICE_REGISTERED, '1');
+      setCookieVal(STORAGE_DEVICE_REGISTERED, '1');
+      await idbSet(STORAGE_DEVICE_REGISTERED, '1');
+      updateSignupDeviceNotice();
+    }
+
+    async function isDeviceLocallyRegistered() {
+      if (localStorage.getItem(STORAGE_DEVICE_REGISTERED) === '1') return true;
+      if (getCookieVal(STORAGE_DEVICE_REGISTERED) === '1') return true;
+      if (getOwnedRefCodes().length > 0) return true;
+      const idbReg = await idbGet(STORAGE_DEVICE_REGISTERED);
+      if (idbReg === '1') {
+        localStorage.setItem(STORAGE_DEVICE_REGISTERED, '1');
+        setCookieVal(STORAGE_DEVICE_REGISTERED, '1');
+        return true;
+      }
+      return false;
+    }
+
+    async function updateSignupDeviceNotice() {
+      const notice = document.getElementById('signup-device-lock-notice');
+      if (!notice) return;
+      const locked = await isDeviceLocallyRegistered();
+      notice.classList.toggle('hidden', !locked);
+    }
 
     // ==================== CACHE HELPERS ====================
     function getCacheKey(uid) {
@@ -940,6 +1169,8 @@
         teamHasMore = Boolean(parsed.teamHasMore);
         teamOldestTs = parsed.teamOldestTs || 0;
         lastMainSyncAt = parsed.lastMainSyncAt || 0;
+        lastPendingSyncAt = parsed.lastPendingSyncAt || 0;
+        hasSyncedPendingOnce = Boolean(parsed.hasSyncedPendingOnce);
         lastHistorySyncAt = parsed.lastHistorySyncAt || 0;
         lastTeamFetchAt = parsed.lastTeamFetchAt || 0;
         return true;
@@ -960,6 +1191,8 @@
           teamHasMore,
           teamOldestTs,
           lastMainSyncAt,
+          lastPendingSyncAt,
+          hasSyncedPendingOnce,
           lastHistorySyncAt,
           lastTeamFetchAt
         }));
@@ -979,6 +1212,139 @@
       const pktTime = new Date(getServerNow() + 5 * 60 * 60 * 1000);
       const hour = pktTime.getUTCHours();
       return hour >= 9 && hour < 22;
+    }
+
+    // ==================== 5 REJECTED DEPOSITS -> 3-DAY BAN HELPERS ====================
+    function formatRemainingLockTime(ms) {
+      const totalSec = Math.max(0, Math.floor(ms / 1000));
+      const days = Math.floor(totalSec / 86400);
+      const hours = Math.floor((totalSec % 86400) / 3600);
+      const mins = Math.floor((totalSec % 3600) / 60);
+      const secs = totalSec % 60;
+      if (days > 0) return `${days}d ${hours}h ${mins}m`;
+      if (hours > 0) return `${hours}h ${mins}m ${secs}s`;
+      return `${mins}m ${secs}s`;
+    }
+
+    function buildDepositBanMessage(banUntilTs) {
+      const rem = Math.max(0, banUntilTs - getServerNow());
+      const remStr = formatRemainingLockTime(rem);
+      const unlockStr = formatDateTime(banUntilTs);
+      return `Your account has been temporarily locked for 3 days because 5 deposit requests were rejected. You can login again after 3 days (${unlockStr} — Remaining: ${remStr}).`;
+    }
+
+    async function checkAndHandleDepositBan(uid, preloadedUserData = null, options = {}) {
+      const { userObj = null, forceCheckRejected = false, precountedRejected = null } = options;
+
+      let uData = preloadedUserData;
+      if (!uData) {
+        uData = (await restGet(`users/${uid}`, {}, userObj)) || {};
+      }
+
+      const serverNow = getServerNow();
+      const banAt = Number(uData.depositBanAt || 0);
+
+      if (banAt > 0) {
+        const banUntil = banAt + DEPOSIT_BAN_DURATION_MS;
+        if (serverNow < banUntil) {
+          return {
+            banned: true,
+            banUntil,
+            userData: uData,
+            message: buildDepositBanMessage(banUntil)
+          };
+        }
+
+        // 3 Days passed -> verify rejected count and unlock via server rules
+        const rejData = precountedRejected !== null
+          ? null
+          : await restGet(`deposits/${uid}`, { orderBy: 'status', equalTo: 'Rejected' }, userObj);
+        const totalRejected = precountedRejected !== null
+          ? precountedRejected
+          : Object.keys(rejData || {}).length;
+        const newCounted = Math.max(Number(uData.depositBanCounted || 0) + MAX_REJECTED_DEPOSITS, totalRejected);
+
+        try {
+          await runDbTask(() => db.ref(`users/${uid}`).update({
+            depositBanCounted: newCounted,
+            depositBanAt: null
+          }));
+          uData.depositBanCounted = newCounted;
+          delete uData.depositBanAt;
+          return { banned: false, unlockedNow: true, userData: uData };
+        } catch (unlockErr) {
+          return {
+            banned: true,
+            banUntil,
+            userData: uData,
+            message: buildDepositBanMessage(banUntil)
+          };
+        }
+      }
+
+      if (!forceCheckRejected && precountedRejected === null) {
+        return { banned: false, userData: uData };
+      }
+
+      const totalRejected = precountedRejected !== null
+        ? precountedRejected
+        : Object.keys((await restGet(`deposits/${uid}`, { orderBy: 'status', equalTo: 'Rejected' }, userObj)) || {}).length;
+
+      const counted = Number(uData.depositBanCounted || 0);
+
+      if ((totalRejected - counted) >= MAX_REJECTED_DEPOSITS) {
+        const confirmedBanAt = await runDbTask(async () => {
+          await db.ref(`users/${uid}/depositBanAt`).set(firebase.database.ServerValue.TIMESTAMP);
+          const snap = await db.ref(`users/${uid}/depositBanAt`).once('value');
+          return Number(snap.val() || getServerNow());
+        });
+        const banUntil = confirmedBanAt + DEPOSIT_BAN_DURATION_MS;
+        uData.depositBanAt = confirmedBanAt;
+        return {
+          banned: true,
+          justTriggered: true,
+          banUntil,
+          userData: uData,
+          message: buildDepositBanMessage(banUntil)
+        };
+      }
+
+      return { banned: false, userData: uData };
+    }
+
+    async function forceBanLogout(message) {
+      const uid = currentAuthUser ? currentAuthUser.uid : null;
+      isAuthenticatingCheck = true;
+      try {
+        forceInstantDisconnect();
+        clearTimeout(inactivitySleepTimer);
+        clearLocalCache(uid);
+        await auth.signOut();
+      } catch (e) {
+        console.error('Ban logout error:', e);
+      } finally {
+        currentAuthUser = null;
+        userData = null;
+        userProfile = null;
+        userPending = { deposit: null, withdraw: null };
+        historyState = {
+          initialized: false, deposits: [], withdrawals: [],
+          maxDepTs: 0, maxWdTs: 0, oldestDepTs: 0, oldestWdTs: 0,
+          hasMoreDeposits: false, hasMoreWithdrawals: false
+        };
+        cachedTeamMembers = [];
+        teamHasMore = false;
+        teamOldestTs = 0;
+        hasSyncedPendingOnce = false;
+        lastPendingSyncAt = 0;
+        isAuthenticatingCheck = false;
+
+        document.getElementById('main-view').classList.add('hidden');
+        document.getElementById('auth-view').classList.remove('hidden');
+        switchAuthTab('login');
+        showAuthAlert(message, 'warning');
+        showToast('Account locked for 3 days (5 rejected deposits)', 'error');
+      }
     }
 
     // ==================== SECURITY & VALIDATION HELPERS ====================
@@ -1016,67 +1382,23 @@
       btn.querySelector('.eye-closed').classList.toggle('hidden', !show);
     }
 
-    // ==================== DEVICE FINGERPRINTING ====================
-    function getDeviceId() {
-      let id = localStorage.getItem(STORAGE_DEVICE_ID);
-      if (!id) {
-        id = (window.crypto && crypto.randomUUID)
-          ? crypto.randomUUID()
-          : 'dev_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 10);
-        localStorage.setItem(STORAGE_DEVICE_ID, id);
-      }
-      return id;
-    }
-
-    function getDeviceHash() {
-      const raw = [
-        navigator.userAgent || '',
-        screen.width + 'x' + screen.height + 'x' + (screen.colorDepth || ''),
-        Intl.DateTimeFormat().resolvedOptions().timeZone || '',
-        navigator.hardwareConcurrency || '',
-        navigator.platform || '',
-        navigator.language || ''
-      ].join('|');
-
-      let h1 = 0x811c9dc5;
-      let h2 = 0x9e3779b9;
-      for (let i = 0; i < raw.length; i++) {
-        const ch = raw.charCodeAt(i);
-        h1 ^= ch;
-        h1 = Math.imul(h1, 0x01000193);
-        h2 ^= (ch + i);
-        h2 = Math.imul(h2, 0x85ebca6b);
-      }
-      return (h1 >>> 0).toString(16).padStart(8, '0') + (h2 >>> 0).toString(16).padStart(8, '0');
-    }
-
-    function getOwnedRefCodes() {
-      try { return JSON.parse(localStorage.getItem(STORAGE_OWNED_REFS) || '[]'); }
-      catch { return []; }
-    }
-
-    function addOwnedRefCode(code) {
-      const list = getOwnedRefCodes();
-      if (!list.includes(code)) {
-        list.push(code);
-        localStorage.setItem(STORAGE_OWNED_REFS, JSON.stringify(list));
-      }
-    }
-
     // ==================== INITIALIZATION ====================
-    window.addEventListener('DOMContentLoaded', () => {
+    window.addEventListener('DOMContentLoaded', async () => {
+      await syncPersistentDeviceId();
+      await updateSignupDeviceNotice();
       const params = new URLSearchParams(window.location.search);
       const ref = params.get('ref');
       if (ref) {
         localStorage.setItem(STORAGE_PENDING_REF, ref.trim().toUpperCase());
-        switchAuthTab('signup');
+        const alreadyReg = await isDeviceLocallyRegistered();
+        switchAuthTab(alreadyReg ? 'login' : 'signup');
       }
       startCountdownLoop();
     });
 
     auth.onAuthStateChanged(async (user) => {
       document.getElementById('boot-loader').classList.add('hidden');
-      if (isSigningUpFlow) return;
+      if (isSigningUpFlow || isAuthenticatingCheck) return;
 
       if (!user) {
         forceInstantDisconnect();
@@ -1093,31 +1415,51 @@
         cachedTeamMembers = [];
         teamHasMore = false;
         teamOldestTs = 0;
+        hasSyncedPendingOnce = false;
+        lastPendingSyncAt = 0;
         document.getElementById('auth-view').classList.remove('hidden');
         document.getElementById('main-view').classList.add('hidden');
+        updateSignupDeviceNotice();
         return;
       }
 
       currentAuthUser = user;
+      const hasCache = loadFromLocalCache(user.uid);
+
+      if (hasCache && userData && Number(userData.depositBanAt || 0) > 0) {
+        try {
+          const banStatus = await checkAndHandleDepositBan(user.uid, userData, { userObj: user });
+          if (banStatus.banned) {
+            await forceBanLogout(banStatus.message);
+            return;
+          }
+          userData = banStatus.userData;
+          saveToLocalCache(user.uid);
+        } catch (err) {
+          console.error('Ban check error:', err);
+        }
+      }
+
       resetInactivityTimer();
       document.getElementById('auth-view').classList.add('hidden');
       document.getElementById('main-view').classList.remove('hidden');
 
-      const hasCache = loadFromLocalCache(user.uid);
       if (hasCache) {
         renderActiveViewOnly();
       }
 
-      const cacheExpired = (Date.now() - lastMainSyncAt) > CACHE_TTL_MS;
+      const cacheExpired = (Date.now() - lastMainSyncAt) > getEffectiveSyncTtl();
       if (!hasCache || !userProfile || cacheExpired) {
-        await syncUserDashboard(true);
+        await syncUserDashboard(false);
       }
     });
 
-    // ==================== ULTRA-LOW-BANDWIDTH ON-DEMAND SYNC ====================
-    async function syncUserDashboard(force = false) {
+    // ==================== ULTRA-OPTIMIZED SMART SYNC (REST READS + CONDITIONAL QUERIES) ====================
+    async function syncUserDashboard(force = false, options = {}) {
       if (!currentAuthUser || isRefreshing) return;
-      if (!force && (Date.now() - lastMainSyncAt) < CACHE_TTL_MS) return;
+      const { skipUserFetch = false, skipBanCheck = false } = options;
+
+      if (!force && (Date.now() - lastMainSyncAt) < getEffectiveSyncTtl()) return;
 
       isRefreshing = true;
       const uid = currentAuthUser.uid;
@@ -1125,36 +1467,52 @@
       const hadPendingWd = Boolean(userPending.withdraw);
 
       try {
-        await runDbTask(async () => {
-          const tasks = [
-            db.ref(`users/${uid}`).once('value'),
-            db.ref(`userPending/${uid}`).once('value'),
-            db.ref(`referralBonuses/${uid}`).orderByChild('claimed').equalTo(false).once('value')
-          ];
+        const now = Date.now();
 
-          const needProfile = !userProfile;
-          if (needProfile) {
-            tasks.push(db.ref(`userProfiles/${uid}`).once('value'));
+        // 1. Fetch users/{uid} ONLY if not already fetched by login
+        if (!skipUserFetch || !userData) {
+          const freshUser = await restGet(`users/${uid}`);
+          if (freshUser) userData = freshUser;
+          else if (!userData) {
+            userData = { depositBalance: 0, earningBalance: 0, teamAllCount: 0, teamInvestmentTotal: 0, teamReferralEarnedTotal: 0 };
           }
+        }
 
-          const results = await Promise.all(tasks);
-          const uSnap = results[0];
-          const pendSnap = results[1];
-          const bonusSnap = results[2];
+        // 2. Decide which lightweight conditional reads are actually needed
+        const needProfile = !userProfile;
+        const needPending =
+          !hasSyncedPendingOnce ||
+          hadPendingDep ||
+          hadPendingWd ||
+          (now - lastPendingSyncAt) > PENDING_SAFETY_TTL_MS;
+        const needBonuses = Number(userData.teamAllCount || 0) > 0;
 
-          if (uSnap.exists()) userData = uSnap.val();
-          else if (!userData) userData = { depositBalance: 0, earningBalance: 0, teamAllCount: 0, teamInvestmentTotal: 0, teamReferralEarnedTotal: 0 };
+        const parallelReads = [];
+        const keys = [];
 
-          const pendVal = pendSnap.val() || {};
-          userPending = {
-            deposit: pendVal.deposit || null,
-            withdraw: pendVal.withdraw || null
-          };
+        if (needProfile) {
+          keys.push('profile');
+          parallelReads.push(restGet(`userProfiles/${uid}`));
+        }
+        if (needPending) {
+          keys.push('pending');
+          parallelReads.push(restGet(`userPending/${uid}`));
+        }
+        if (needBonuses) {
+          keys.push('bonuses');
+          parallelReads.push(restGet(`referralBonuses/${uid}`, { orderBy: 'claimed', equalTo: false }));
+        }
 
-          if (needProfile) {
-            const profSnap = results[3];
-            if (profSnap.exists()) {
-              userProfile = profSnap.val();
+        const results = parallelReads.length > 0 ? await Promise.all(parallelReads) : [];
+
+        let pendVal = null;
+        let bonusesObj = null;
+
+        keys.forEach((k, i) => {
+          if (k === 'profile') {
+            const prof = results[i];
+            if (prof) {
+              userProfile = prof;
             } else if (userData && (userData.username || userData.refCode)) {
               userProfile = {
                 username: userData.username || 'User',
@@ -1169,24 +1527,53 @@
                 joinedAt: userData.joinedAt || Date.now()
               };
             }
+          } else if (k === 'pending') {
+            pendVal = results[i] || {};
+            userPending = {
+              deposit: pendVal.deposit || null,
+              withdraw: pendVal.withdraw || null
+            };
+            hasSyncedPendingOnce = true;
+            lastPendingSyncAt = now;
+          } else if (k === 'bonuses') {
+            bonusesObj = results[i];
           }
+        });
 
-          if ((hadPendingDep && !userPending.deposit) || (hadPendingWd && !userPending.withdraw)) {
-            lastHistorySyncAt = 0;
+        const pendingDepJustResolved = hadPendingDep && !userPending.deposit;
+        const pendingWdJustResolved = hadPendingWd && !userPending.withdraw;
+        if (pendingDepJustResolved || pendingWdJustResolved) {
+          lastHistorySyncAt = 0;
+        }
+
+        // 3. NEVER query deposits/{uid} automatically unless a pending deposit just finished or a ban is active!
+        if (!skipBanCheck) {
+          const hasBan = Number(userData.depositBanAt || 0) > 0;
+          if (hasBan || pendingDepJustResolved) {
+            const banStatus = await checkAndHandleDepositBan(uid, userData, {
+              forceCheckRejected: pendingDepJustResolved
+            });
+            if (banStatus.banned) {
+              await forceBanLogout(banStatus.message);
+              return;
+            }
+            if (banStatus.userData) userData = banStatus.userData;
           }
+        }
 
-          const bonuses = [];
-          bonusSnap.forEach((c) => { bonuses.push({ id: c.key, ...c.val() }); });
-
+        // 4. Claim referral bonuses (only if teamAllCount > 0 and unclaimed bonuses exist)
+        if (bonusesObj && typeof bonusesObj === 'object') {
+          const bonuses = Object.entries(bonusesObj).map(([id, val]) => ({ id, ...val }));
           if (bonuses.length > 0) {
             await claimReferralBonuses(bonuses);
           }
+        }
 
-          await archiveCompletedVipsIfNeeded();
+        // 5. Archive 90-day completed VIPs only if any exist locally
+        await archiveCompletedVipsIfNeeded();
 
-          lastMainSyncAt = Date.now();
-          saveToLocalCache(uid);
-        });
+        lastMainSyncAt = Date.now();
+        saveToLocalCache(uid);
 
         renderActiveViewOnly();
         if (!document.getElementById('deposit-modal').classList.contains('hidden')) {
@@ -1219,7 +1606,7 @@
 
       if (toDeleteLocal.length > 0) {
         try {
-          await db.ref().update(updates);
+          await runDbTask(() => db.ref().update(updates));
           toDeleteLocal.forEach(id => { delete userData.activeVips[id]; });
         } catch (err) {
           console.error('Archive VIP error:', err);
@@ -1234,8 +1621,11 @@
 
       try {
         const legacyClaimed = userData.claimedBonuses || {};
-        for (const bonus of unclaimedBonuses) {
-          if (!bonus.claimed && !legacyClaimed[bonus.id]) {
+        const pendingToClaim = unclaimedBonuses.filter(b => !b.claimed && !legacyClaimed[b.id]);
+        if (!pendingToClaim.length) return;
+
+        await runDbTask(async () => {
+          for (const bonus of pendingToClaim) {
             const newBal = Number((Number(userData.earningBalance || 0) + Number(bonus.amount || 0)).toFixed(2));
             const updates = {};
             updates[`users/${uid}/earningBalance`] = newBal;
@@ -1247,7 +1637,7 @@
             userData.earningBalance = newBal;
             showToast(`Referral Bonus ${formatCurrency(bonus.amount)} credited!`);
           }
-        }
+        });
       } catch (err) {
         console.error('Referral claim error:', err);
       } finally {
@@ -1255,12 +1645,12 @@
       }
     }
 
-    // ==================== PAGINATED HISTORY + DELTA SYNC ====================
+    // ==================== PAGINATED HISTORY + DELTA SYNC (VIA REST API) ====================
     async function loadHistoryIfNeeded(force = false) {
       if (!currentAuthUser) return;
       const now = Date.now();
 
-      if (!force && historyState.initialized && (now - lastHistorySyncAt) < 60000) {
+      if (!force && historyState.initialized && (now - lastHistorySyncAt) < HISTORY_TTL_MS) {
         return;
       }
 
@@ -1268,103 +1658,116 @@
       if (badge) badge.classList.remove('hidden');
 
       try {
-        await runDbTask(async () => {
-          const uid = currentAuthUser.uid;
+        const uid = currentAuthUser.uid;
 
-          if (!historyState.initialized) {
-            const [dSnap, wSnap] = await Promise.all([
-              db.ref(`deposits/${uid}`).orderByChild('createdAt').limitToLast(HISTORY_PAGE_SIZE).once('value'),
-              db.ref(`withdrawals/${uid}`).orderByChild('createdAt').limitToLast(HISTORY_PAGE_SIZE).once('value')
-            ]);
+        if (!historyState.initialized) {
+          const [dObj, wObj] = await Promise.all([
+            restGet(`deposits/${uid}`, { orderBy: 'createdAt', limitToLast: HISTORY_PAGE_SIZE }),
+            restGet(`withdrawals/${uid}`, { orderBy: 'createdAt', limitToLast: HISTORY_PAGE_SIZE })
+          ]);
 
-            const dList = [];
-            let maxDepTs = 0;
-            let oldestDepTs = Infinity;
-            dSnap.forEach((c) => {
-              const val = { id: c.key, ...c.val() };
-              const ts = Number(val.createdAt || 0);
-              dList.push(val);
-              if (ts > maxDepTs) maxDepTs = ts;
-              if (ts < oldestDepTs) oldestDepTs = ts;
-            });
-            dList.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+          const dList = [];
+          let maxDepTs = 0;
+          let oldestDepTs = Infinity;
+          Object.entries(dObj || {}).forEach(([id, v]) => {
+            const val = { id, ...v };
+            const ts = Number(val.createdAt || 0);
+            dList.push(val);
+            if (ts > maxDepTs) maxDepTs = ts;
+            if (ts < oldestDepTs) oldestDepTs = ts;
+          });
+          dList.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
 
-            const wList = [];
-            let maxWdTs = 0;
-            let oldestWdTs = Infinity;
-            wSnap.forEach((c) => {
-              const val = { id: c.key, ...c.val() };
-              const ts = Number(val.createdAt || 0);
-              wList.push(val);
-              if (ts > maxWdTs) maxWdTs = ts;
-              if (ts < oldestWdTs) oldestWdTs = ts;
-            });
-            wList.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+          const wList = [];
+          let maxWdTs = 0;
+          let oldestWdTs = Infinity;
+          Object.entries(wObj || {}).forEach(([id, v]) => {
+            const val = { id, ...v };
+            const ts = Number(val.createdAt || 0);
+            wList.push(val);
+            if (ts > maxWdTs) maxWdTs = ts;
+            if (ts < oldestWdTs) oldestWdTs = ts;
+          });
+          wList.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
 
-            historyState = {
-              initialized: true,
-              deposits: dList,
-              withdrawals: wList,
-              maxDepTs,
-              maxWdTs,
-              oldestDepTs: oldestDepTs === Infinity ? 0 : oldestDepTs,
-              oldestWdTs: oldestWdTs === Infinity ? 0 : oldestWdTs,
-              hasMoreDeposits: dList.length >= HISTORY_PAGE_SIZE,
-              hasMoreWithdrawals: wList.length >= HISTORY_PAGE_SIZE
-            };
-          } else {
-            const pendingDeps = historyState.deposits.filter(d => normalizeStatus(d.status) === 'Pending');
-            const pendingWds = historyState.withdrawals.filter(w => normalizeStatus(w.status) === 'Pending');
+          historyState = {
+            initialized: true,
+            deposits: dList,
+            withdrawals: wList,
+            maxDepTs,
+            maxWdTs,
+            oldestDepTs: oldestDepTs === Infinity ? 0 : oldestDepTs,
+            oldestWdTs: oldestWdTs === Infinity ? 0 : oldestWdTs,
+            hasMoreDeposits: dList.length >= HISTORY_PAGE_SIZE,
+            hasMoreWithdrawals: wList.length >= HISTORY_PAGE_SIZE
+          };
+        } else {
+          const pendingDeps = historyState.deposits.filter(d => normalizeStatus(d.status) === 'Pending');
+          const pendingWds = historyState.withdrawals.filter(w => normalizeStatus(w.status) === 'Pending');
 
-            const queries = [
-              db.ref(`deposits/${uid}`).orderByChild('createdAt').startAt(historyState.maxDepTs + 1).once('value'),
-              db.ref(`withdrawals/${uid}`).orderByChild('createdAt').startAt(historyState.maxWdTs + 1).once('value'),
-              ...pendingDeps.map(d => db.ref(`deposits/${uid}/${d.id}`).once('value')),
-              ...pendingWds.map(w => db.ref(`withdrawals/${uid}/${w.id}`).once('value'))
-            ];
+          const queries = [
+            restGet(`deposits/${uid}`, { orderBy: 'createdAt', startAt: historyState.maxDepTs + 1 }),
+            restGet(`withdrawals/${uid}`, { orderBy: 'createdAt', startAt: historyState.maxWdTs + 1 }),
+            ...pendingDeps.map(d => restGet(`deposits/${uid}/${d.id}`)),
+            ...pendingWds.map(w => restGet(`withdrawals/${uid}/${w.id}`))
+          ];
 
-            const res = await Promise.all(queries);
-            const newDepsSnap = res[0];
-            const newWdsSnap = res[1];
+          const res = await Promise.all(queries);
+          const newDepsObj = res[0] || {};
+          const newWdsObj = res[1] || {};
 
-            let idx = 2;
-            for (const pDep of pendingDeps) {
-              const s = res[idx++];
-              if (s.exists()) {
-                const updated = { id: s.key, ...s.val() };
-                const pos = historyState.deposits.findIndex(x => x.id === updated.id);
-                if (pos !== -1) historyState.deposits[pos] = updated;
-              }
+          let idx = 2;
+          for (const pDep of pendingDeps) {
+            const updatedVal = res[idx++];
+            if (updatedVal) {
+              const updated = { id: pDep.id, ...updatedVal };
+              const pos = historyState.deposits.findIndex(x => x.id === updated.id);
+              if (pos !== -1) historyState.deposits[pos] = updated;
             }
-            for (const pWd of pendingWds) {
-              const s = res[idx++];
-              if (s.exists()) {
-                const updated = { id: s.key, ...s.val() };
-                const pos = historyState.withdrawals.findIndex(x => x.id === updated.id);
-                if (pos !== -1) historyState.withdrawals[pos] = updated;
-              }
+          }
+          for (const pWd of pendingWds) {
+            const updatedVal = res[idx++];
+            if (updatedVal) {
+              const updated = { id: pWd.id, ...updatedVal };
+              const pos = historyState.withdrawals.findIndex(x => x.id === updated.id);
+              if (pos !== -1) historyState.withdrawals[pos] = updated;
             }
-
-            const depMap = new Map(historyState.deposits.map(d => [d.id, d]));
-            newDepsSnap.forEach((c) => {
-              const val = { id: c.key, ...c.val() };
-              depMap.set(val.id, val);
-              if (Number(val.createdAt || 0) > historyState.maxDepTs) historyState.maxDepTs = Number(val.createdAt || 0);
-            });
-            historyState.deposits = Array.from(depMap.values()).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
-
-            const wdMap = new Map(historyState.withdrawals.map(w => [w.id, w]));
-            newWdsSnap.forEach((c) => {
-              const val = { id: c.key, ...c.val() };
-              wdMap.set(val.id, val);
-              if (Number(val.createdAt || 0) > historyState.maxWdTs) historyState.maxWdTs = Number(val.createdAt || 0);
-            });
-            historyState.withdrawals = Array.from(wdMap.values()).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
           }
 
-          lastHistorySyncAt = now;
-          saveToLocalCache(uid);
-        });
+          const depMap = new Map(historyState.deposits.map(d => [d.id, d]));
+          Object.entries(newDepsObj).forEach(([id, v]) => {
+            const val = { id, ...v };
+            depMap.set(val.id, val);
+            if (Number(val.createdAt || 0) > historyState.maxDepTs) historyState.maxDepTs = Number(val.createdAt || 0);
+          });
+          historyState.deposits = Array.from(depMap.values()).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+
+          const wdMap = new Map(historyState.withdrawals.map(w => [w.id, w]));
+          Object.entries(newWdsObj).forEach(([id, v]) => {
+            const val = { id, ...v };
+            wdMap.set(val.id, val);
+            if (Number(val.createdAt || 0) > historyState.maxWdTs) historyState.maxWdTs = Number(val.createdAt || 0);
+          });
+          historyState.withdrawals = Array.from(wdMap.values()).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+        }
+
+        lastHistorySyncAt = now;
+        saveToLocalCache(uid);
+
+        // Count rejected directly from memory (0 extra Firebase query!)
+        const rejectedInMemory = historyState.deposits.filter(d => normalizeStatus(d.status) === 'Rejected').length;
+        const counted = Number((userData && userData.depositBanCounted) || 0);
+        if ((rejectedInMemory - counted) >= MAX_REJECTED_DEPOSITS || Number((userData && userData.depositBanAt) || 0) > 0) {
+          const banStatus = await checkAndHandleDepositBan(uid, userData, {
+            precountedRejected: historyState.hasMoreDeposits ? null : rejectedInMemory,
+            forceCheckRejected: true
+          });
+          if (banStatus.banned) {
+            await forceBanLogout(banStatus.message);
+            return;
+          }
+        }
+
         renderHistoryTab();
       } catch (err) {
         console.error('History load error:', err);
@@ -1387,33 +1790,36 @@
       }
 
       try {
-        await runDbTask(async () => {
-          const path = isDep ? `deposits/${uid}` : `withdrawals/${uid}`;
-          const snap = await db.ref(path).orderByChild('createdAt').endAt(oldestTs - 1).limitToLast(HISTORY_PAGE_SIZE).once('value');
-          const older = [];
-          let newOldest = oldestTs;
-          snap.forEach((c) => {
-            const val = { id: c.key, ...c.val() };
-            const ts = Number(val.createdAt || 0);
-            older.push(val);
-            if (ts < newOldest) newOldest = ts;
-          });
-
-          if (isDep) {
-            const map = new Map(historyState.deposits.map(d => [d.id, d]));
-            older.forEach(d => map.set(d.id, d));
-            historyState.deposits = Array.from(map.values()).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
-            historyState.oldestDepTs = newOldest;
-            historyState.hasMoreDeposits = older.length >= HISTORY_PAGE_SIZE;
-          } else {
-            const map = new Map(historyState.withdrawals.map(w => [w.id, w]));
-            older.forEach(w => map.set(w.id, w));
-            historyState.withdrawals = Array.from(map.values()).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
-            historyState.oldestWdTs = newOldest;
-            historyState.hasMoreWithdrawals = older.length >= HISTORY_PAGE_SIZE;
-          }
-          saveToLocalCache(uid);
+        const path = isDep ? `deposits/${uid}` : `withdrawals/${uid}`;
+        const snapObj = await restGet(path, {
+          orderBy: 'createdAt',
+          endAt: oldestTs - 1,
+          limitToLast: HISTORY_PAGE_SIZE
         });
+
+        const older = [];
+        let newOldest = oldestTs;
+        Object.entries(snapObj || {}).forEach(([id, v]) => {
+          const val = { id, ...v };
+          const ts = Number(val.createdAt || 0);
+          older.push(val);
+          if (ts < newOldest) newOldest = ts;
+        });
+
+        if (isDep) {
+          const map = new Map(historyState.deposits.map(d => [d.id, d]));
+          older.forEach(d => map.set(d.id, d));
+          historyState.deposits = Array.from(map.values()).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+          historyState.oldestDepTs = newOldest;
+          historyState.hasMoreDeposits = older.length >= HISTORY_PAGE_SIZE;
+        } else {
+          const map = new Map(historyState.withdrawals.map(w => [w.id, w]));
+          older.forEach(w => map.set(w.id, w));
+          historyState.withdrawals = Array.from(map.values()).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+          historyState.oldestWdTs = newOldest;
+          historyState.hasMoreWithdrawals = older.length >= HISTORY_PAGE_SIZE;
+        }
+        saveToLocalCache(uid);
         renderHistoryTab();
       } catch (err) {
         console.error('Load older history error:', err);
@@ -1426,7 +1832,7 @@
       }
     }
 
-    // ==================== PAGINATED TEAM MEMBERS ====================
+    // ==================== PAGINATED TEAM MEMBERS (VIA REST API) ====================
     async function loadTeamMembersIfNeeded(force = false) {
       if (!currentAuthUser || !userData) return;
       if (!force && Number(userData.teamAllCount || 0) === 0) {
@@ -1435,26 +1841,27 @@
         return;
       }
       const now = Date.now();
-      if (!force && (now - lastTeamFetchAt) < CACHE_TTL_MS) return;
+      if (!force && (now - lastTeamFetchAt) < NORMAL_CACHE_TTL_MS) return;
 
       try {
-        await runDbTask(async () => {
-          const snap = await db.ref(`teamMembers/${currentAuthUser.uid}`).orderByChild('joinedAt').limitToLast(TEAM_PAGE_SIZE).once('value');
-          const list = [];
-          let oldest = Infinity;
-          snap.forEach((child) => {
-            const val = { uid: child.key, ...child.val() };
-            const ts = Number(val.joinedAt || 0);
-            list.push(val);
-            if (ts < oldest) oldest = ts;
-          });
-          list.sort((a, b) => (b.joinedAt || 0) - (a.joinedAt || 0));
-          cachedTeamMembers = list;
-          teamOldestTs = oldest === Infinity ? 0 : oldest;
-          teamHasMore = list.length >= TEAM_PAGE_SIZE;
-          lastTeamFetchAt = now;
-          saveToLocalCache(currentAuthUser.uid);
+        const snapObj = await restGet(`teamMembers/${currentAuthUser.uid}`, {
+          orderBy: 'joinedAt',
+          limitToLast: TEAM_PAGE_SIZE
         });
+        const list = [];
+        let oldest = Infinity;
+        Object.entries(snapObj || {}).forEach(([uid, v]) => {
+          const val = { uid, ...v };
+          const ts = Number(val.joinedAt || 0);
+          list.push(val);
+          if (ts < oldest) oldest = ts;
+        });
+        list.sort((a, b) => (b.joinedAt || 0) - (a.joinedAt || 0));
+        cachedTeamMembers = list;
+        teamOldestTs = oldest === Infinity ? 0 : oldest;
+        teamHasMore = list.length >= TEAM_PAGE_SIZE;
+        lastTeamFetchAt = now;
+        saveToLocalCache(currentAuthUser.uid);
         if (currentTab === 'invite') renderInviteTab();
       } catch (err) {
         console.error('Team fetch error:', err);
@@ -1470,23 +1877,25 @@
       }
 
       try {
-        await runDbTask(async () => {
-          const snap = await db.ref(`teamMembers/${currentAuthUser.uid}`).orderByChild('joinedAt').endAt(teamOldestTs - 1).limitToLast(TEAM_PAGE_SIZE).once('value');
-          const older = [];
-          let newOldest = teamOldestTs;
-          snap.forEach((child) => {
-            const val = { uid: child.key, ...child.val() };
-            const ts = Number(val.joinedAt || 0);
-            older.push(val);
-            if (ts < newOldest) newOldest = ts;
-          });
-          const map = new Map(cachedTeamMembers.map(m => [m.uid, m]));
-          older.forEach(m => map.set(m.uid, m));
-          cachedTeamMembers = Array.from(map.values()).sort((a, b) => (b.joinedAt || 0) - (a.joinedAt || 0));
-          teamOldestTs = newOldest;
-          teamHasMore = older.length >= TEAM_PAGE_SIZE;
-          saveToLocalCache(currentAuthUser.uid);
+        const snapObj = await restGet(`teamMembers/${currentAuthUser.uid}`, {
+          orderBy: 'joinedAt',
+          endAt: teamOldestTs - 1,
+          limitToLast: TEAM_PAGE_SIZE
         });
+        const older = [];
+        let newOldest = teamOldestTs;
+        Object.entries(snapObj || {}).forEach(([uid, v]) => {
+          const val = { uid, ...v };
+          const ts = Number(val.joinedAt || 0);
+          older.push(val);
+          if (ts < newOldest) newOldest = ts;
+        });
+        const map = new Map(cachedTeamMembers.map(m => [m.uid, m]));
+        older.forEach(m => map.set(m.uid, m));
+        cachedTeamMembers = Array.from(map.values()).sort((a, b) => (b.joinedAt || 0) - (a.joinedAt || 0));
+        teamOldestTs = newOldest;
+        teamHasMore = older.length >= TEAM_PAGE_SIZE;
+        saveToLocalCache(currentAuthUser.uid);
         renderInviteTab();
       } catch (err) {
         console.error('Load more members error:', err);
@@ -1552,7 +1961,7 @@
       return Boolean(userPending.withdraw && normalizeStatus(userPending.withdraw.status) === 'Pending');
     }
 
-    async function generateUniqueRefCode() {
+    async function generateUniqueRefCode(userObj = null) {
       const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
       for (let attempt = 0; attempt < 8; attempt++) {
         let code = 'OC';
@@ -1563,8 +1972,8 @@
         } else {
           for (let i = 0; i < 6; i++) code += chars[Math.floor(Math.random() * chars.length)];
         }
-        const snap = await db.ref(`refCodes/${code}`).once('value');
-        if (!snap.exists()) return code;
+        const existing = await restGet(`refCodes/${code}`, {}, userObj);
+        if (!existing) return code;
       }
       return 'OC' + Date.now().toString(36).slice(-6).toUpperCase();
     }
@@ -1614,6 +2023,7 @@
         loginForm.classList.add('hidden');
         signupBtn.className = 'py-2.5 text-sm font-bold rounded-xl bg-white text-teal-700 shadow-sm transition';
         loginBtn.className = 'py-2.5 text-sm font-bold rounded-xl text-slate-500 hover:text-teal-700 transition';
+        updateSignupDeviceNotice();
       }
     }
 
@@ -1625,6 +2035,13 @@
       const email = document.getElementById('signup-email').value.trim().toLowerCase();
       const password = document.getElementById('signup-password').value;
       const btn = document.getElementById('signup-submit-btn');
+
+      if (await isDeviceLocallyRegistered()) {
+        const msg = 'An account has already been created on this device. Multiple accounts on one device are not allowed. Please login to your existing account.';
+        showAuthAlert(msg, 'warning');
+        showToast(msg, 'error');
+        return;
+      }
 
       if (username.length < 3) {
         showAuthAlert('Username must be at least 3 characters.');
@@ -1639,13 +2056,27 @@
       btn.textContent = 'Creating Account...';
       isSigningUpFlow = true;
 
+      let createdCred = null;
+
       try {
-        const cred = await auth.createUserWithEmailAndPassword(email, password);
-        const uid = cred.user.uid;
-        const deviceId = getDeviceId();
+        const deviceId = await syncPersistentDeviceId();
         const deviceHash = getDeviceHash();
+
+        createdCred = await auth.createUserWithEmailAndPassword(email, password);
+        const uid = createdCred.user.uid;
         const ownedRefs = getOwnedRefCodes();
         const pendingRef = localStorage.getItem(STORAGE_PENDING_REF);
+
+        // REST API reads first (0 WebSocket connections)
+        const [devHashVal, devIdVal] = await Promise.all([
+          restGet(`registeredDevices/${deviceHash}`, {}, createdCred.user),
+          restGet(`registeredDeviceIds/${deviceId}`, {}, createdCred.user)
+        ]);
+
+        if (devHashVal || devIdVal) {
+          await markDeviceLocallyRegistered();
+          throw { code: 'CUSTOM_DEVICE_ALREADY_REGISTERED' };
+        }
 
         let referredBy = null;
         let referredByUid = null;
@@ -1654,87 +2085,97 @@
         let referrerDeviceHash = null;
         let selfReferralBlocked = false;
 
-        await runDbTask(async () => {
-          if (pendingRef) {
-            const refSnap = await db.ref(`refCodes/${pendingRef}`).once('value');
-            if (refSnap.exists()) {
-              const refInfo = refSnap.val();
-              const isSameDevice =
-                refInfo.deviceId === deviceId ||
-                refInfo.deviceHash === deviceHash ||
-                ownedRefs.includes(pendingRef) ||
-                refInfo.uid === uid;
+        if (pendingRef) {
+          const refInfo = await restGet(`refCodes/${pendingRef}`, {}, createdCred.user);
+          if (refInfo) {
+            const isSameDevice =
+              refInfo.deviceId === deviceId ||
+              refInfo.deviceHash === deviceHash ||
+              ownedRefs.includes(pendingRef) ||
+              refInfo.uid === uid;
 
-              if (isSameDevice) {
-                selfReferralBlocked = true;
-              } else {
-                referredBy = pendingRef;
-                referredByUid = refInfo.uid;
-                referrerDeviceId = refInfo.deviceId || null;
-                referrerDeviceHash = refInfo.deviceHash || null;
-                const existingChain = Array.isArray(refInfo.chain) ? refInfo.chain : [];
-                referrerChain = [refInfo.uid, ...existingChain].slice(0, 8);
-              }
+            if (isSameDevice) {
+              selfReferralBlocked = true;
+            } else {
+              referredBy = pendingRef;
+              referredByUid = refInfo.uid;
+              referrerDeviceId = refInfo.deviceId || null;
+              referrerDeviceHash = refInfo.deviceHash || null;
+              const existingChain = Array.isArray(refInfo.chain) ? refInfo.chain : [];
+              referrerChain = [refInfo.uid, ...existingChain].slice(0, 8);
             }
           }
+        }
 
-          const myRefCode = await generateUniqueRefCode();
+        const myRefCode = await generateUniqueRefCode(createdCred.user);
 
-          const hotUserObj = {
-            earningBalance: 0,
-            depositBalance: 0,
-            teamAllCount: 0,
-            teamInvestmentTotal: 0,
-            teamReferralEarnedTotal: 0
-          };
+        const hotUserObj = {
+          earningBalance: 0,
+          depositBalance: 0,
+          teamAllCount: 0,
+          teamInvestmentTotal: 0,
+          teamReferralEarnedTotal: 0
+        };
 
-          const profileObj = {
+        const profileObj = {
+          username,
+          email,
+          refCode: myRefCode,
+          referredBy,
+          referredByUid,
+          referrerChain,
+          referrerDeviceId,
+          referrerDeviceHash,
+          selfReferralBlocked,
+          deviceId,
+          deviceHash,
+          joinedAt: firebase.database.ServerValue.TIMESTAMP
+        };
+
+        const updates = {};
+        updates[`users/${uid}`] = hotUserObj;
+        updates[`userProfiles/${uid}`] = profileObj;
+        updates[`refCodes/${myRefCode}`] = { uid, deviceId, deviceHash, chain: referrerChain };
+        updates[`registeredDevices/${deviceHash}`] = {
+          uid,
+          createdAt: firebase.database.ServerValue.TIMESTAMP
+        };
+        updates[`registeredDeviceIds/${deviceId}`] = {
+          uid,
+          createdAt: firebase.database.ServerValue.TIMESTAMP
+        };
+        updates[`stats/totalUsers`] = firebase.database.ServerValue.increment(1);
+
+        if (referredByUid && !selfReferralBlocked) {
+          updates[`teamMembers/${referredByUid}/${uid}`] = {
             username,
-            email,
-            refCode: myRefCode,
-            referredBy,
-            referredByUid,
-            referrerChain,
-            referrerDeviceId,
-            referrerDeviceHash,
-            selfReferralBlocked,
-            deviceId,
-            deviceHash,
-            joinedAt: firebase.database.ServerValue.TIMESTAMP
+            joinedAt: firebase.database.ServerValue.TIMESTAMP,
+            investment: 0,
+            referralEarned: 0
           };
-
-          const updates = {};
-          updates[`users/${uid}`] = hotUserObj;
-          updates[`userProfiles/${uid}`] = profileObj;
-          updates[`refCodes/${myRefCode}`] = { uid, deviceId, deviceHash, chain: referrerChain };
-          updates[`stats/totalUsers`] = firebase.database.ServerValue.increment(1);
-
-          if (referredByUid && !selfReferralBlocked) {
-            updates[`teamMembers/${referredByUid}/${uid}`] = {
-              username,
-              joinedAt: firebase.database.ServerValue.TIMESTAMP,
-              investment: 0,
-              referralEarned: 0
-            };
-            for (const ancUid of referrerChain) {
-              updates[`users/${ancUid}/teamAllCount`] = firebase.database.ServerValue.increment(1);
-            }
+          for (const ancUid of referrerChain) {
+            updates[`users/${ancUid}/teamAllCount`] = firebase.database.ServerValue.increment(1);
           }
+        }
 
-          await db.ref().update(updates);
-          addOwnedRefCode(myRefCode);
-          userData = hotUserObj;
-          userProfile = { ...profileObj, joinedAt: Date.now() };
-          userPending = { deposit: null, withdraw: null };
-        });
+        await runDbTask(() => db.ref().update(updates));
+
+        addOwnedRefCode(myRefCode);
+        await markDeviceLocallyRegistered();
+
+        userData = hotUserObj;
+        userProfile = { ...profileObj, joinedAt: Date.now() };
+        userPending = { deposit: null, withdraw: null };
+        hasSyncedPendingOnce = true;
+        lastPendingSyncAt = Date.now();
 
         localStorage.removeItem(STORAGE_PENDING_REF);
         document.getElementById('signup-form').reset();
 
-        currentAuthUser = cred.user;
+        currentAuthUser = createdCred.user;
         isSigningUpFlow = false;
         lastMainSyncAt = Date.now();
-        saveToLocalCache(uid);
+        saveToLocalCache(createdCred.user.uid);
         resetInactivityTimer();
 
         document.getElementById('auth-view').classList.add('hidden');
@@ -1747,12 +2188,33 @@
           showToast('Account created successfully!');
         }
       } catch (err) {
+        if (createdCred && createdCred.user) {
+          try { await createdCred.user.delete(); }
+          catch (_) { try { await auth.signOut(); } catch (__) {} }
+        }
         isSigningUpFlow = false;
+
         let msg = 'Failed to create account. Please try again.';
-        if (err.code === 'auth/email-already-in-use') msg = 'This email is already registered. Please login instead.';
-        else if (err.code === 'auth/invalid-email') msg = 'Please enter a valid email address.';
-        else if (err.code === 'auth/weak-password') msg = 'Password is too weak. Use at least 6 characters.';
-        else if (err.code === 'auth/network-request-failed') msg = 'Network error. Please check your internet connection.';
+        if (err && err.code === 'CUSTOM_DEVICE_ALREADY_REGISTERED') {
+          msg = 'Only 1 account is allowed per device! Please login to your existing account.';
+          showAuthAlert(msg, 'warning');
+          showToast(msg, 'error');
+          return;
+        } else if (err && String(err.message || '').toLowerCase().includes('permission')) {
+          await markDeviceLocallyRegistered();
+          msg = 'Multiple accounts are not allowed on one device! Please login to your existing account.';
+          showAuthAlert(msg, 'warning');
+          showToast(msg, 'error');
+          return;
+        } else if (err.code === 'auth/email-already-in-use') {
+          msg = 'This email is already registered. Please login instead.';
+        } else if (err.code === 'auth/invalid-email') {
+          msg = 'Please enter a valid email address.';
+        } else if (err.code === 'auth/weak-password') {
+          msg = 'Password is too weak. Use at least 6 characters.';
+        } else if (err.code === 'auth/network-request-failed') {
+          msg = 'Network error. Please check your internet connection.';
+        }
         showAuthAlert(msg, 'error');
         showToast(msg, 'error');
       } finally {
@@ -1780,14 +2242,63 @@
 
       btn.disabled = true;
       btn.textContent = 'Logging in...';
+      isAuthenticatingCheck = true;
 
       try {
-        await auth.signInWithEmailAndPassword(email, password);
+        const cred = await auth.signInWithEmailAndPassword(email, password);
+        const uid = cred.user.uid;
+
+        // Load immutable profile / history cache if previously saved on this browser
+        loadFromLocalCache(uid);
+
+        // Single read of users/{uid} via REST API
+        const freshUser = (await restGet(`users/${uid}`, {}, cred.user)) || {};
+
+        // Only check Rejected deposits on login if ban is active OR user previously had deposit activity
+        const mayHaveDeposits =
+          Number(freshUser.depositBanAt || 0) > 0 ||
+          Number(freshUser.depositBalance || 0) > 0 ||
+          Boolean(freshUser.activeVips) ||
+          hasPendingDeposit() ||
+          historyState.deposits.length > 0;
+
+        const banStatus = await checkAndHandleDepositBan(uid, freshUser, {
+          userObj: cred.user,
+          forceCheckRejected: mayHaveDeposits
+        });
+
+        if (banStatus.banned) {
+          clearLocalCache(uid);
+          await auth.signOut();
+          isAuthenticatingCheck = false;
+          showAuthAlert(banStatus.message, 'warning');
+          showToast('Account locked for 3 days due to 5 rejected deposits', 'error');
+          return;
+        }
+
         localStorage.removeItem(STORAGE_LOGIN_FAILS);
         localStorage.removeItem(STORAGE_LOGIN_LOCK);
         document.getElementById('login-form').reset();
-        showToast('Welcome back!');
+
+        currentAuthUser = cred.user;
+        userData = banStatus.userData || freshUser;
+        hasSyncedPendingOnce = false; // Check userPending once on fresh login
+        isAuthenticatingCheck = false;
+
+        resetInactivityTimer();
+        document.getElementById('auth-view').classList.add('hidden');
+        document.getElementById('main-view').classList.remove('hidden');
+
+        // Pass skipUserFetch & skipBanCheck to avoid duplicate reads
+        await syncUserDashboard(true, { skipUserFetch: true, skipBanCheck: true });
+
+        if (banStatus.unlockedNow) {
+          showToast('3-day lock expired. Welcome back!');
+        } else {
+          showToast('Welcome back!');
+        }
       } catch (err) {
+        isAuthenticatingCheck = false;
         let fails = Number(localStorage.getItem(STORAGE_LOGIN_FAILS) || 0) + 1;
         localStorage.setItem(STORAGE_LOGIN_FAILS, String(fails));
         if (fails >= 5) {
@@ -1823,6 +2334,8 @@
       selectedWithdrawMethodId = null;
       pendingWithdrawDraft = null;
       vipCardsRendered = false;
+      hasSyncedPendingOnce = false;
+      lastPendingSyncAt = 0;
       showToast('Logged out');
     }
 
@@ -1848,6 +2361,8 @@
 
       if (tab === 'invite') {
         loadTeamMembersIfNeeded(false);
+      } else if (tab === 'withdraw' && hasPendingWithdraw() && (Date.now() - lastMainSyncAt) > 30000) {
+        syncUserDashboard(true);
       }
       renderActiveViewOnly();
     }
@@ -1891,6 +2406,11 @@
       updateDepositModalLockState();
       document.getElementById('deposit-modal').classList.remove('hidden');
       document.getElementById('deposit-modal').classList.add('flex');
+
+      // Only check pending status if user actually has a pending deposit
+      if (hasPendingDeposit() && (Date.now() - lastMainSyncAt) > 30000) {
+        syncUserDashboard(true);
+      }
     }
 
     function closeDepositModal() {
@@ -2004,6 +2524,8 @@
         await runDbTask(() => db.ref().update(updates));
 
         userPending.deposit = { ...pendingMarker, createdAt: nowTs };
+        hasSyncedPendingOnce = true;
+        lastPendingSyncAt = nowTs;
         if (historyState.initialized) {
           historyState.deposits.unshift({ ...depRecord, createdAt: nowTs });
           if (nowTs > historyState.maxDepTs) historyState.maxDepTs = nowTs;
@@ -2069,7 +2591,6 @@
             instanceId, vipId: plan.id, purchasedAt: getServerNow(), lastClaimTime: 0, daysClaimed: 0
           };
 
-          // Commission ONLY triggers when User B buys a VIP
           const referredByUid = getProfileField('referredByUid', null);
           if (referredByUid) {
             const myDevId = getDeviceId();
@@ -2399,6 +2920,8 @@
 
         userData.earningBalance = newEarningBal;
         userPending.withdraw = { ...pendingMarker, createdAt: nowTs };
+        hasSyncedPendingOnce = true;
+        lastPendingSyncAt = nowTs;
         if (historyState.initialized) {
           historyState.withdrawals.unshift({ ...wdRecord, createdAt: nowTs });
           if (nowTs > historyState.maxWdTs) historyState.maxWdTs = nowTs;
